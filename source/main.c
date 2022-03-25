@@ -4,6 +4,7 @@
 #include <3ds.h>
 
 #define ERR_ALREADY_EXISTS (Result)0xC82044BE
+#define ERR_NO_GAME_CARD (Result)0xC880448D
 // Inner FAT file/dir names are ascii and can only go up to 16 characters anyway, so this should fit the name + a null byte
 #define NAME_UTF8_BUF_SIZE 17
 
@@ -178,7 +179,12 @@ Result get_gamecard_tid(u64 *title_id) {
 
 	res = AM_GetTitleCount(MEDIATYPE_GAME_CARD, &count);
 	if (R_FAILED(res)) {
-		return r("AM_GetTitleCount", res);
+		if (res == ERR_NO_GAME_CARD) {
+			title_id = 0;
+			return 0;
+		} else {
+			return r("AM_GetTitleCount", res);
+		}
 	}
 
 	// i'm gonna assume there is one title here
@@ -260,7 +266,7 @@ void start_process(void) {
 
 	printf("--------------------------------\n");
 	printf("Title ID: %016llx\n", title_id);
-
+	printf("\n");
 	printf("Press X to copy from GAMECARD to DIGITAL.\n");
 	printf("Press Y to copy from DIGITAL to GAMECARD.\n");
 	printf("Press B to cancel.\n");
