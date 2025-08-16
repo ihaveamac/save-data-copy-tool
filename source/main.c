@@ -5,11 +5,12 @@
 
 #define ERR_ALREADY_EXISTS (Result)0xC82044BE
 #define ERR_NO_GAME_CARD (Result)0xC880448D
+#define ERR_INVALID_STATE (Result)0xC8A04555
 // Inner FAT file/dir names are ascii and can only go up to 16 characters anyway, so this should fit the name + a null byte
 #define NAME_UTF8_BUF_SIZE 17
 
 Result r(char *name, Result res) {
-	if (R_FAILED(res)) printf("%s: 0x%08lx\n", name, res);
+	/*if (R_FAILED(res))*/ printf("%s: 0x%08lx\n", name, res);
 	return res;
 }
 
@@ -89,7 +90,7 @@ Result copy_dir(FS_Archive dstarc, char *dstpath, FS_Archive srcarc, char *srcpa
 
 			res = FSFILE_Read(srchandle, &total_read, 0, file_data, file_size);
 			r("FSFILE_Read", res);
-			FSFILE_Close(srchandle);
+			r("FSFILE_Close", FSFILE_Close(srchandle));
 			if (R_FAILED(res)) {
 				free(file_data);
 				break;
@@ -120,7 +121,7 @@ Result copy_dir(FS_Archive dstarc, char *dstpath, FS_Archive srcarc, char *srcpa
 			res = FSFILE_Flush(dsthandle);
 			r("FSFILE_Flush", res);
 
-			FSFILE_Close(dsthandle);
+			r("FSFILE_Close", FSFILE_Close(dsthandle));
 			if (R_FAILED(res)) {
 				break;
 			}
@@ -128,7 +129,7 @@ Result copy_dir(FS_Archive dstarc, char *dstpath, FS_Archive srcarc, char *srcpa
 	} while (read);
 
 fail:
-	FSDIR_Close(srcdirhandle);
+	r("FSDIR_Close", FSDIR_Close(srcdirhandle));
 	free(name_utf8);
 	free(src_full_path);
 	free(dst_full_path);
@@ -191,18 +192,62 @@ Result get_gamecard_tid(u64 *title_id) {
 	// unless nintendo releases a new 3DS with two game card slots then i'm fine
 	if (count != 1) return 0;
 
-	res = AM_GetTitleList(NULL, MEDIATYPE_GAME_CARD, 1, title_id);
-	if (R_FAILED(res)) {
-		return r("AM_GetTitleList", res);
+	res = r("AM_GetTitleList", AM_GetTitleList(NULL, MEDIATYPE_GAME_CARD, 1, title_id));
+
+	return res;
+}
+
+Result create_backup_dir(char *path, u64 title_id, FS_Archive sdarc) {
+	Result res;
+
+	res = FSUSER_CreateDirectory(sdarc, fsMakePath(PATH_ASCII, "/sdct-backup"), 0);
+	if (R_FAILED(res) && res != ERR_ALREADY_EXISTS) {
+		printf("Failed to create: /sdct-backup\n");
+		return r("FSUSER_CreateDirectory(/sdct-backup)", res);
+	}
+
+	snprintf(path, 0x100, "/sdct-backup/%016llx-%lld", title_id, time(NULL));
+
+	res = FSUSER_CreateDirectory(sdarc, fsMakePath(PATH_ASCII, path), 0);
+	if (R_FAILED(res) && res != ERR_ALREADY_EXISTS) {
+		printf("Failed to create: %s\n", path);
+		return r("FSUSER_CreateDirectory", res);
 	}
 
 	return res;
-}	
+}
+
+Result backup_save(u64 title_id, FS_Archive backuparc) {
+	Result res;
+
+	FS_Archive sdarc;
+
+	res = FSUSER_OpenArchive(&sdarc, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""));
+	if (R_FAILED(res)) {
+		return r("FSUSER_OpenArchive(sdmc)", res);
+	}
+
+	char destination[0x100];
+	res = create_backup_dir(destination, title_id, sdarc);
+	if (R_FAILED(res)) {
+		FSUSER_CloseArchive(sdarc);
+		return res;
+	}
+
+	printf("Creating backup at:\n  %s\n", destination);
+	res = copy_dir(sdarc, destination, backuparc, "/");
+	if (R_SUCCEEDED(res)) printf("Done!\n");
+
+	FSUSER_CloseArchive(sdarc);
+	return res;
+}
 
 Result copy_game_save(u64 title_id, FS_MediaType dst_mt, FS_MediaType src_mt) {
 	Result res;
 
-	FS_Archive dstarc, srcarc;
+	FS_Archive dstarc_backup = 0;
+	FS_Archive dstarc = 0;
+	FS_Archive srcarc = 0;
 
 	printf("Title ID: %016llx\n", title_id);
 
@@ -214,11 +259,30 @@ Result copy_game_save(u64 title_id, FS_MediaType dst_mt, FS_MediaType src_mt) {
 	FS_Path src_path = (FS_Path){PATH_BINARY, 12, src_path_info};
 	FS_Path dst_path = (FS_Path){PATH_BINARY, 12, dst_path_info};
 
+	char *dest_type = dst_mt == MEDIATYPE_SD ? "digital" : "gamecard";
+
 	printf("Target: %s\n", dst_mt == MEDIATYPE_SD ? "digital" : "gamecard");
+	
+	res = FSUSER_OpenArchive(&dstarc_backup, ARCHIVE_USER_SAVEDATA, dst_path);
+	if (R_FAILED(res)) {
+		if (res == ERR_INVALID_STATE) {
+			printf("%s save doesn't exist, skipping backup\n", dest_type);
+		} else {
+			printf("Could not open %s save for backup.\n", dest_type);
+			return r("FSUSER_OpenArchive(dst)", res);
+		}
+	} else {
+		res = backup_save(title_id, dstarc_backup);
+		FSUSER_CloseArchive(dstarc_backup);
+		if (R_FAILED(res)) {
+			printf("Failed to create backup, not continuing!\n");
+			return res;
+		}
+	}
 
 	res = format_with_same_info(dst_path, src_path);
 	if (R_FAILED(res)) return res;
-	
+
 	res = FSUSER_OpenArchive(&dstarc, ARCHIVE_USER_SAVEDATA, dst_path);
 	if (R_FAILED(res)) {
 		return r("FSUSER_OpenArchive(dst)", res);
@@ -233,14 +297,13 @@ Result copy_game_save(u64 title_id, FS_MediaType dst_mt, FS_MediaType src_mt) {
 	res = copy_dir(dstarc, "/", srcarc, "/");
 	if (R_SUCCEEDED(res)) printf("Done!\n");
 
-	FSUSER_CloseArchive(dstarc);
-	FSUSER_CloseArchive(srcarc);
+	r("FSUSER_CloseArchive(dst)", FSUSER_CloseArchive(dstarc));
+	r("FSUSER_CloseArchive(src)", FSUSER_CloseArchive(srcarc));
 	return res;
 }
 
 void print_help(void) {
 	consoleClear();
-	//printf("WARNING: This will OVERWRITE the target game save.\n");
 	printf("WARNING: This will OVERWRITE the target save.\n");
 	printf("WARNING: This is in development. It can go wrong.\n");
 	printf("WARNING: You are responsible for making backups.\n");
